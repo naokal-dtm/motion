@@ -21,17 +21,15 @@ button.sub{background:var(--card);color:var(--fg);border:1px solid var(--mut)}
 #status{font-size:13px;color:var(--mut)}
 .grid{display:grid;grid-template-columns:1fr 1fr;gap:6px;font-size:14px;font-variant-numeric:tabular-nums}
 .grid b{color:var(--accent)}
-#v3{width:100%;height:240px;display:block;border-radius:10px;background:var(--bg)}
+#v3{width:100%;height:340px;display:block;border-radius:10px;background:var(--bg)}
 input[type=range]{width:100%}
+label{font-size:13px;color:var(--mut)}
 </style>
 </head>
 <body>
 <h1>全身モーショントラッカー</h1>
 <div class="card">
-  <div class="stage">
-    <video id="vid" playsinline muted></video>
-    <canvas id="ov"></canvas>
-  </div>
+  <div class="stage"><video id="vid" playsinline muted></video><canvas id="ov"></canvas></div>
   <div class="row">
     <button id="go">カメラ開始</button>
     <button id="flip" class="sub">前/背面切替</button>
@@ -39,34 +37,80 @@ input[type=range]{width:100%}
   </div>
 </div>
 <div class="card">
+  <canvas id="v3"></canvas>
+  <label>3Dアバターの回転</label>
+  <input type="range" id="yaw" min="-180" max="180" value="0">
+  <label><input type="checkbox" id="mir" checked> 鏡のように表示</label>
+</div>
+<div class="card">
   <div class="grid">
     <div>左ひじ <b id="a0">–</b></div><div>右ひじ <b id="a1">–</b></div>
     <div>左ひざ <b id="a2">–</b></div><div>右ひざ <b id="a3">–</b></div>
-    <div>左肩 <b id="a4">–</b></div><div>右肩 <b id="a5">–</b></div>
-    <div>FPS <b id="fps">–</b></div><div>検出点 <b id="cnt">–</b></div>
+    <div>顔 左右 <b id="fy">–</b></div><div>顔 上下 <b id="fp">–</b></div>
+    <div>顔 傾き <b id="fr">–</b></div><div>手の検出 <b id="hd">–</b></div>
+    <div>FPS <b id="fps">–</b></div><div>体の検出点 <b id="cnt">–</b></div>
   </div>
 </div>
-<div class="card">
-  <canvas id="v3"></canvas>
-  <label style="font-size:13px;color:var(--mut)">3Dビューの回転</label>
-  <input type="range" id="yaw" min="-180" max="180" value="0">
-</div>
-<p style="font-size:12px;color:var(--mut)">全身が映るよう2〜3m離れて撮影してください。映像は端末外に送信されず、ブラウザ内で処理されます。</p>
+<p style="font-size:12px;color:var(--mut)">全身が映るよう2〜3m離れて撮影してください。画面外や未検出の部位は、基本姿勢(テンプレ)へゆっくり戻ります。映像は端末内で処理されます。</p>
 
 <script type="module">
-import {PoseLandmarker, FilesetResolver} from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/vision_bundle.mjs";
+import {PoseLandmarker,HandLandmarker,FaceLandmarker,FilesetResolver} from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/vision_bundle.mjs";
 const $=id=>document.getElementById(id);
 const vid=$("vid"),ov=$("ov"),ctx=ov.getContext("2d"),v3=$("v3"),c3=v3.getContext("2d");
-let landmarker=null,facing="user",stream=null,running=false,last=0,fps=0;
+let pose=null,handM=null,faceM=null,facing="user",stream=null,running=false,last=0,fps=0,n=0,handR=null,faceR=null;
 const status=t=>$("status").textContent=t;
-const CONN=[[11,12],[11,13],[13,15],[12,14],[14,16],[11,23],[12,24],[23,24],[23,25],[25,27],[24,26],[26,28],[27,29],[29,31],[27,31],[28,30],[30,32],[28,32],[15,17],[15,19],[15,21],[16,18],[16,20],[16,22],[0,11],[0,12]];
+
+// ---- 調整用パラメータ ----
+const FOLLOW=18;   // 検出値への追従(大きいほど速い/ブレやすい)
+const RISE=6;      // テンプレ→検出ポーズへ移る速さ(1/秒)
+const FALL=.35;    // 検出→テンプレへ戻る速さ(1/秒, .35≒約3秒)
+
+// ---- 素体テンプレ(腰中心・単位m・y下向き・z奥向き) ----
+const T=[[0,-.66,-.06],[.02,-.69,-.05],[.05,-.69,-.05],[.08,-.68,-.04],[-.02,-.69,-.05],[-.05,-.69,-.05],[-.08,-.68,-.04],[.10,-.66,.02],[-.10,-.66,.02],[.03,-.60,-.05],[-.03,-.60,-.05],[.19,-.50,0],[-.19,-.50,0],[.22,-.24,0],[-.22,-.24,0],[.23,-.01,0],[-.23,-.01,0],[.25,.04,0],[-.25,.04,0],[.23,.06,-.02],[-.23,.06,-.02],[.21,.03,-.03],[-.21,.03,-.03],[.09,0,0],[-.09,0,0],[.10,.40,0],[-.10,.40,0],[.10,.80,0],[-.10,.80,0],[.10,.84,.04],[-.10,.84,.04],[.11,.86,-.10],[-.11,.86,-.10]];
+function handT(s){const p=[0,0,0],bx=[-.04,-.02,0,.02,.036],len=[[.02,.03,.025,.02],[.09,.04,.025,.02],[.095,.045,.028,.02],[.09,.04,.025,.02],[.08,.03,.02,.016]];
+  for(let f=0;f<5;f++){let y=0,z=0;for(let k=0;k<4;k++){y+=len[f][k];z-=k*.006;p.push(bx[f]*s,y,z)}}return p}
+const HT=[handT(1),handT(-1)];
+const BODY=[[11,12],[11,13],[13,15],[12,14],[14,16],[11,23],[12,24],[23,24],[23,25],[25,27],[24,26],[26,28],[27,29],[29,31],[27,31],[28,30],[30,32],[28,32]];
+const HEAD=[[7,0],[8,0],[1,2],[2,3],[4,5],[5,6],[9,10],[7,8]];
+const HC=[[0,1],[1,2],[2,3],[3,4],[0,5],[5,6],[6,7],[7,8],[5,9],[9,10],[10,11],[11,12],[9,13],[13,14],[14,15],[15,16],[13,17],[17,18],[18,19],[19,20],[0,17]];
+
+// ---- テンプレ⇔検出のなめらかな合成 ----
+const st=()=>({w:0,h:null});
+const bodyS=Array.from({length:33},st),handS=[st(),st()],headS=st();
+const ez=w=>w*w*(3-2*w);
+function track(s,seen,det,dt){
+  if(seen){
+    if(!s.h)s.h=Array.from(det);else{const k=1-Math.exp(-FOLLOW*dt);for(let i=0;i<det.length;i++)s.h[i]+=(det[i]-s.h[i])*k}
+    s.w+=(1-s.w)*(1-Math.exp(-RISE*dt));
+  }else s.w=Math.max(0,s.w-FALL*dt);
+}
+function out(s,tpl){const e=ez(s.w);return tpl.map((t,i)=>s.h&&e>0?t+(s.h[i]-t)*e:t)}
+const rotM=(a,b,c)=>{const ca=Math.cos(a),sa=Math.sin(a),cb=Math.cos(b),sb=Math.sin(b),cc=Math.cos(c),sc=Math.sin(c);
+  return[[ca*cc+sa*sb*sc,-ca*sc+sa*sb*cc,sa*cb],[cb*sc,cb*cc,-sb],[-sa*cc+ca*sb*sc,sa*sc+ca*sb*cc,ca*cb]]};
+const mv=(R,o)=>[R[0][0]*o[0]+R[0][1]*o[1]+R[0][2]*o[2],R[1][0]*o[0]+R[1][1]*o[1]+R[1][2]*o[2],R[2][0]*o[0]+R[2][1]*o[1]+R[2][2]*o[2]];
+const ang=(a,b,c)=>{const u=[a[0]-b[0],a[1]-b[1],a[2]-b[2]],v=[c[0]-b[0],c[1]-b[1],c[2]-b[2]];
+  const d=u[0]*v[0]+u[1]*v[1]+u[2]*v[2],m=Math.hypot(...u)*Math.hypot(...v);
+  return m?Math.round(Math.acos(Math.max(-1,Math.min(1,d/m)))*180/Math.PI)+"°":"–"};
+const inside=p=>(p.visibility??1)>.5&&p.x>.01&&p.x<.99&&p.y>.01&&p.y<.99;
+
+// 検出された手を、近い手首(左=15/右=16)に割り当てる
+function assign(hs,L){
+  const r=[-1,-1];if(!hs||!hs.length||!L)return r;
+  const d=(h,j)=>Math.hypot(hs[h][0].x-L[j].x,hs[h][0].y-L[j].y);
+  if(hs.length===1){const a=d(0,15),b=d(0,16);if(Math.min(a,b)<.25)r[a<b?0:1]=0}
+  else if(d(0,15)+d(1,16)<=d(1,15)+d(0,16)){r[0]=0;r[1]=1}else{r[0]=1;r[1]=0}
+  return r;
+}
 
 async function loadModel(){
   status("モデル読み込み中…");
-  const fs=await FilesetResolver.forVisionTasks("https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm");
-  const url="https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/1/pose_landmarker_lite.task";
-  const mk=d=>PoseLandmarker.createFromOptions(fs,{baseOptions:{modelAssetPath:url,delegate:d},runningMode:"VIDEO",numPoses:1});
-  try{landmarker=await mk("GPU")}catch(e){landmarker=await mk("CPU")}
+  const V="https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14",G="https://storage.googleapis.com/mediapipe-models/";
+  const fs=await FilesetResolver.forVisionTasks(V+"/wasm");
+  const mk=async(C,p,o)=>{for(const d of["GPU","CPU"]){try{return await C.createFromOptions(fs,{baseOptions:{modelAssetPath:G+p,delegate:d},runningMode:"VIDEO",...o})}catch(e){}}return null};
+  pose=await mk(PoseLandmarker,"pose_landmarker/pose_landmarker_lite/float16/1/pose_landmarker_lite.task",{numPoses:1});
+  if(!pose)throw new Error("姿勢モデルを読み込めません");
+  handM=await mk(HandLandmarker,"hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task",{numHands:2});
+  faceM=await mk(FaceLandmarker,"face_landmarker/face_landmarker/float16/1/face_landmarker.task",{numFaces:1,outputFacialTransformationMatrixes:true});
 }
 async function startCam(){
   if(stream)stream.getTracks().forEach(t=>t.stop());
@@ -76,49 +120,89 @@ async function startCam(){
 }
 $("go").onclick=async()=>{
   try{
-    if(!landmarker)await loadModel();
+    if(!pose)await loadModel();
     await startCam();
-    if(!running){running=true;loop()}
-    status("トラッキング中");$("go").textContent="再開始";
+    if(!running){running=true;last=performance.now();loop()}
+    status("トラッキング中"+(handM?"":"(手なし)")+(faceM?"":"(顔なし)"));$("go").textContent="再開始";
   }catch(e){status("エラー: "+(e.message||e)+"(カメラ許可/ネットワークを確認)")}
 };
 $("flip").onclick=async()=>{facing=facing==="user"?"environment":"user";if(stream)try{await startCam()}catch(e){status("切替失敗")}};
 
-const ang=(a,b,c)=>{const u=[a.x-b.x,a.y-b.y,a.z-b.z],v=[c.x-b.x,c.y-b.y,c.z-b.z];
-  const d=u[0]*v[0]+u[1]*v[1]+u[2]*v[2],n=Math.hypot(...u)*Math.hypot(...v);
-  return n?Math.round(Math.acos(Math.max(-1,Math.min(1,d/n)))*180/Math.PI):null};
-
 function loop(){
   requestAnimationFrame(loop);
-  if(!landmarker||vid.readyState<2||vid.paused)return;
-  const now=performance.now();
+  if(!pose||vid.readyState<2||vid.paused)return;
+  const now=performance.now(),dt=Math.min(.1,(now-last)/1000);last=now;
+  fps=fps*.9+(1/Math.max(dt,.001))*.1;$("fps").textContent=fps.toFixed(0);
   if(ov.width!==vid.videoWidth){ov.width=vid.videoWidth;ov.height=vid.videoHeight}
-  const res=landmarker.detectForVideo(vid,now);
-  const dt=now-last;last=now;fps=fps*.9+(1000/dt)*.1;$("fps").textContent=fps.toFixed(0);
-  ctx.clearRect(0,0,ov.width,ov.height);
-  const L=res.landmarks[0],W=res.worldLandmarks[0];
-  if(!L){$("cnt").textContent="0";draw3d(null);return}
-  const vis=L.filter(p=>(p.visibility??1)>.5).length;$("cnt").textContent=vis+"/33";
-  ctx.lineWidth=Math.max(3,ov.width/200);ctx.strokeStyle="#00e0a0";
-  for(const[a,b]of CONN){if((L[a].visibility??1)<.4||(L[b].visibility??1)<.4)continue;
-    ctx.beginPath();ctx.moveTo(L[a].x*ov.width,L[a].y*ov.height);ctx.lineTo(L[b].x*ov.width,L[b].y*ov.height);ctx.stroke()}
-  ctx.fillStyle="#ff4d6d";
-  L.forEach((p,i)=>{if(i>10&&(p.visibility??1)>.4){ctx.beginPath();ctx.arc(p.x*ov.width,p.y*ov.height,ctx.lineWidth*1.3,0,7);ctx.fill()}});
-  const A=[[11,13,15],[12,14,16],[23,25,27],[24,26,28],[13,11,23],[14,12,24]];
-  A.forEach((t,i)=>{const v=ang(W[t[0]],W[t[1]],W[t[2]]);$("a"+i).textContent=v==null?"–":v+"°"});
-  draw3d(W);
+  const pr=pose.detectForVideo(vid,now);n++;
+  if(n%2===0&&handM)handR=handM.detectForVideo(vid,now);
+  else if(n%2===1&&faceM)faceR=faceM.detectForVideo(vid,now);
+  const L=pr.landmarks[0],W=pr.worldLandmarks[0];
+
+  // 体:各関節ごとに「見えていれば反映、見えなければテンプレへ戻る」
+  let vis=0;
+  for(let i=0;i<33;i++){const s=!!(L&&inside(L[i]));if(s)vis++;track(bodyS[i],s,s?[W[i].x,W[i].y,W[i].z]:null,dt)}
+  const B=bodyS.map((s,i)=>out(s,T[i]));
+
+  // 顔の向き(顔の変換行列から回転を取り出す)
+  const fm=faceR&&faceR.facialTransformationMatrixes&&faceR.facialTransformationMatrixes[0];
+  let fs=false,fa=null;
+  if(fm&&faceR.faceLandmarks.length){
+    const d=fm.data,D=[1,-1,-1],R=(i,j)=>D[i]*D[j]*d[j*4+i];
+    fa=[Math.atan2(R(0,2),R(2,2)),Math.atan2(-R(1,2),Math.hypot(R(0,2),R(2,2))),Math.atan2(R(1,0),R(1,1))];fs=true;
+  }
+  track(headS,fs,fa,dt);
+  const ha=out(headS,[0,0,0]),HR=rotM(ha[0],ha[1],ha[2]);
+  const C=[0,1,2].map(k=>(B[7][k]+B[8][k])/2);
+  const hp=T.slice(0,11).map(t=>{const o=mv(HR,[t[0],t[1]+.66,t[2]-.02]);return[C[0]+o[0],C[1]+o[1],C[2]+o[2]]});
+  ["fy","fp","fr"].forEach((id,i)=>$(id).textContent=Math.round(ha[i]*180/Math.PI)+"°");
+
+  // 手指
+  const as=assign(handR&&handR.landmarks,L),hands=[],seenH=[];
+  for(let k=0;k<2;k++){
+    const idx=as[k],wl=idx>=0&&handR.worldLandmarks[idx];let det=null;
+    if(wl){det=[];for(const p of wl)det.push(p.x-wl[0].x,p.y-wl[0].y,p.z-wl[0].z)}
+    track(handS[k],!!det,det,dt);seenH.push(!!det);
+    const r=out(handS[k],HT[k]),w=B[15+k],P=[];
+    for(let j=0;j<21;j++)P.push([w[0]+r[j*3],w[1]+r[j*3+1],w[2]+r[j*3+2]]);
+    hands.push(P);
+  }
+  $("hd").textContent=(seenH[0]?"左":"–")+(seenH[1]?"右":"–");
+  $("cnt").textContent=vis+"/33";
+  $("a0").textContent=ang(B[11],B[13],B[15]);$("a1").textContent=ang(B[12],B[14],B[16]);
+  $("a2").textContent=ang(B[23],B[25],B[27]);$("a3").textContent=ang(B[24],B[26],B[28]);
+
+  drawOverlay(L,handR&&handR.landmarks);
+  draw3d({B,hp,C,hands});
 }
-function draw3d(W){
+
+// カメラ映像上には「生の検出結果」だけを表示
+function drawOverlay(L,hs){
+  ctx.clearRect(0,0,ov.width,ov.height);
+  const X=p=>p.x*ov.width,Y=p=>p.y*ov.height;
+  ctx.lineWidth=Math.max(3,ov.width/200);ctx.lineCap="round";
+  if(L){ctx.strokeStyle="#00e0a0";ctx.beginPath();
+    for(const[a,b]of BODY){if(!inside(L[a])||!inside(L[b]))continue;ctx.moveTo(X(L[a]),Y(L[a]));ctx.lineTo(X(L[b]),Y(L[b]))}ctx.stroke()}
+  if(hs)for(const h of hs){ctx.strokeStyle="#ff9f0a";ctx.lineWidth=Math.max(2,ov.width/320);ctx.beginPath();
+    for(const[a,b]of HC){ctx.moveTo(X(h[a]),Y(h[a]));ctx.lineTo(X(h[b]),Y(h[b]))}ctx.stroke()}
+}
+
+// 安定化したアバターを3D表示
+function draw3d(S){
   const r=devicePixelRatio||1,w=v3.clientWidth,h=v3.clientHeight;
-  if(v3.width!==w*r){v3.width=w*r;v3.height=h*r}
-  c3.setTransform(r,0,0,r,0,0);c3.clearRect(0,0,w,h);
-  if(!W)return;
-  const th=$("yaw").value*Math.PI/180,cs=Math.cos(th),sn=Math.sin(th),s=h*.5;
-  const P=W.map(p=>[w/2+(p.x*cs+p.z*sn)*s,h/2+p.y*s*.95,-p.x*sn+p.z*cs]);
-  c3.lineWidth=3;c3.lineCap="round";c3.strokeStyle="#0a84ff";
-  for(const[a,b]of CONN){c3.beginPath();c3.moveTo(P[a][0],P[a][1]);c3.lineTo(P[b][0],P[b][1]);c3.stroke()}
-  c3.fillStyle="#ff4d6d";
-  P.forEach((p,i)=>{if(i>10){c3.beginPath();c3.arc(p[0],p[1],3.5,0,7);c3.fill()}});
+  if(v3.width!==Math.round(w*r)){v3.width=Math.round(w*r);v3.height=Math.round(h*r)}
+  c3.setTransform(r,0,0,r,0,0);c3.clearRect(0,0,w,h);c3.lineCap="round";
+  const th=$("yaw").value*Math.PI/180,cs=Math.cos(th),sn=Math.sin(th),s=h*.5,m=$("mir").checked?-1:1;
+  const pj=p=>[w/2+(p[0]*m*cs+p[2]*sn)*s,h/2+(p[1]-.08)*s];
+  const seg=(P,pairs,col,lw)=>{c3.strokeStyle=col;c3.lineWidth=lw;c3.beginPath();for(const[a,b]of pairs){const A=pj(P[a]),Bq=pj(P[b]);c3.moveTo(A[0],A[1]);c3.lineTo(Bq[0],Bq[1])}c3.stroke()};
+  const dots=(P,idx,col,rad)=>{c3.fillStyle=col;for(const i of idx){const A=pj(P[i]);c3.beginPath();c3.arc(A[0],A[1],rad,0,7);c3.fill()}};
+  seg(S.B,BODY,"#0a84ff",4);
+  dots(S.B,[11,12,13,14,15,16,23,24,25,26,27,28],"#ff4d6d",4);
+  const N=[0,1,2].map(k=>(S.B[11][k]+S.B[12][k])/2);
+  seg([S.C,N],[[0,1]],"#0a84ff",4);
+  seg(S.hp,HEAD,"#0a84ff",2.5);dots(S.hp,[0],"#ff4d6d",3.5);
+  const A=pj(S.C);c3.strokeStyle="#0a84ff";c3.lineWidth=2;c3.beginPath();c3.arc(A[0],A[1],.11*s,0,7);c3.stroke();
+  for(const P of S.hands){seg(P,HC,"#ff9f0a",2.5);dots(P,[...Array(21).keys()],"#ffd60a",2)}
 }
 </script>
 </body>
