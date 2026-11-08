@@ -102,6 +102,81 @@ function assign(hs,L){
   return r;
 }
 
+// ---- 脚の後処理(信頼度重み・左右ID維持・カルマン予測・骨長補正) ----
+// 検出後の座標だけを加工する層。ランドマーク定義(25-32)と出力形式は従来どおり。
+const LJ=[25,27,29,31];                 // 膝・足首・かかと・つま先(左脚。右脚は+1)
+const Q=300,R0=.0009,CMIN=.3,HIDE=1,DAMP=3,REC=.25;
+// Q:加速度ノイズ(大きいほど素早く追従) R0:信頼度1での観測ノイズ CMIN:これ未満は観測として使わない
+// HIDE:予測を続ける最大秒数(超えるとテンプレへ戻る) DAMP:隠れ中の速度減衰(1/秒) REC:再認識の復帰秒数
+class KF{ // 1軸の等速モデル・カルマンフィルタ(状態=位置,速度)
+  constructor(){this.p=0;this.v=0;this.a=1;this.b=0;this.c=1}
+  init(z){this.p=z;this.v=0;this.a=.01;this.b=0;this.c=1}
+  predict(dt,q){this.p+=this.v*dt;this.a+=dt*(2*this.b+dt*this.c)+q*dt*dt*dt/3;this.b+=dt*this.c+q*dt*dt/2;this.c+=q*dt}
+  update(z,r){const S=this.a+r,k0=this.a/S,k1=this.b/S,y=z-this.p,b0=this.b;this.p+=k0*y;this.v+=k1*y;this.a-=k0*this.a;this.b-=k0*b0;this.c-=k1*b0}
+}
+const lg=[0,1].map(()=>LJ.map(()=>({k:[new KF(),new KF(),new KF()],init:false,hid:9,rec:1})));
+let lgMap=0,lgEv=0,prevB=T;
+const lenE=[.40,.40,.06,.12];           // 骨長の推定値[大腿,下腿,足首-かかと,足首-つま先]
+const d3=(a,b)=>Math.hypot(a[0]-b[0],a[1]-b[1],a[2]-b[2]);
+const clampLen=(p,o,len,tol=.15)=>{const d=[p[0]-o[0],p[1]-o[1],p[2]-o[2]],n=Math.hypot(...d);if(!n)return p;const m=Math.min(len*(1+tol),Math.max(len*(1-tol),n));return m===n?p:[o[0]+d[0]*m/n,o[1]+d[1]*m/n,o[2]+d[2]*m/n]};
+function legFilter(L,W,dt){
+  const conf=i=>{const p=L&&L[i];if(!p||p.x<.01||p.x>.99||p.y<.01||p.y>.99)return 0;return(p.visibility??1)*(p.presence??1)};
+  const hip=[0,1].map(t=>L&&inside(L[23+t])?[W[23+t].x,W[23+t].y,W[23+t].z]:prevB[23+t]);
+  // 1) 予測(隠れている間は速度を減衰)
+  for(const t of[0,1])for(const m of lg[t])for(const f of m.k){f.predict(dt,Q);if(m.hid>0)f.v*=Math.exp(-DAMP*dt)}
+  // 2) 検出(画面上の左右ラベル k=0:左脚 1:右脚)
+  const det=[0,1].map(k=>LJ.map(b=>{const i=b+k,c=W?conf(i):0;return{c,z:c>0?[W[i].x,W[i].y,W[i].z]:null}}));
+  const pr=(t,j)=>lg[t][j].k.map(f=>f.p);
+  const cost=(t,k)=>{let s=0,w=0;
+    for(let j=0;j<2;j++){const e=det[k][j];if(e.c<CMIN||!lg[t][j].init)continue;
+      s+=e.c*d3(pr(t,j),e.z);w+=e.c;
+      if(j===0){s+=e.c*.5*Math.abs(d3(e.z,hip[t])-lenE[0]);w+=e.c*.5}}   // 膝-股関節の距離も加味
+    return w?s/w:null};
+  // 3) 左右ID維持:予測位置(位置+速度)との連続性で対応付け。2フレーム連続で明確に入れ替えが有利なときだけ切替
+  let ev=false;
+  if(lg[0][0].init&&lg[1][0].init){
+    let cur=0,alt=0,n=0;
+    for(const k of[0,1]){const a=cost(k^lgMap,k),b=cost(k^lgMap^1,k);if(a!=null&&b!=null){cur+=a;alt+=b;n++}}
+    if(n&&alt<cur*.6&&cur-alt>.08*n)ev=true;
+  }
+  lgEv=ev?lgEv+1:0;if(lgEv>=2){lgMap^=1;lgEv=0}
+  // 4) 観測更新:信頼度で重み付け、予測から外れた値は抑制、再認識は滑らかに復帰
+  for(const t of[0,1])for(let j=0;j<4;j++){
+    const m=lg[t][j],e=det[t^lgMap][j];
+    if(e.c>=CMIN){
+      if(!m.init){m.k.forEach((f,a)=>f.init(e.z[a]));m.init=true;m.hid=0;m.rec=1}
+      else{
+        const pz=m.k.map(f=>f.p),g=1/(1+(d3(pz,e.z)/(.3+.8*Math.min(m.hid,HIDE)))**2);
+        if(m.hid>.2)m.rec=0;
+        m.rec=Math.min(1,m.rec+dt/REC);
+        const q=ez(m.rec),cc=Math.max(.05,e.c*g);
+        m.k.forEach((f,a)=>f.update(pz[a]+(e.z[a]-pz[a])*q,R0/(cc*cc)));
+        m.hid=0;
+      }
+    }else m.hid+=dt;
+  }
+  // 5) 骨長の推定更新(高信頼のときだけ緩やかに)+脚の構造補正(交差は妨げない)
+  const res={};
+  for(const t of[0,1]){
+    const e=det[t^lgMap],M=lg[t],hc=conf(23+t)>.7;
+    const up=(n,A,B)=>{const d=d3(A,B);if(n<2?(d>.2&&d<.6):(d>.02&&d<.3))lenE[n]+=(d-lenE[n])*.03};
+    if(hc&&e[0].c>.7)up(0,hip[t],e[0].z);
+    if(e[0].c>.7&&e[1].c>.7)up(1,e[0].z,e[1].z);
+    if(e[1].c>.7&&e[2].c>.7)up(2,e[1].z,e[2].z);
+    if(e[1].c>.7&&e[3].c>.7)up(3,e[1].z,e[3].z);
+    if(M[0].init&&M[1].init){
+      const P=M.map(m=>m.k.map(f=>f.p));
+      P[0]=clampLen(P[0],hip[t],lenE[0]);
+      P[1]=clampLen(P[1],P[0],lenE[1]);
+      P[2]=clampLen(P[2],P[1],lenE[2],.5);
+      P[3]=clampLen(P[3],P[1],lenE[3],.5);
+      P.forEach((p,j)=>{if(M[j].init)M[j].k.forEach((f,a)=>f.p=p[a])});
+    }
+    M.forEach((m,j)=>{res[LJ[j]+t]={seen:m.init&&m.hid<HIDE,det:m.k.map(f=>f.p)}});
+  }
+  return res;
+}
+
 async function loadModel(){
   status("モデル読み込み中…");
   const V="https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14",G="https://storage.googleapis.com/mediapipe-models/";
@@ -141,8 +216,10 @@ function loop(){
 
   // 体:各関節ごとに「見えていれば反映、見えなければテンプレへ戻る」
   let vis=0;
-  for(let i=0;i<33;i++){const s=!!(L&&inside(L[i]));if(s)vis++;track(bodyS[i],s,s?[W[i].x,W[i].y,W[i].z]:null,dt)}
-  const B=bodyS.map((s,i)=>out(s,T[i]));
+  const LG=legFilter(L,W,dt);   // 脚(25-32)のみ後処理済みの座標に差し替え
+  for(let i=0;i<33;i++){const raw=!!(L&&inside(L[i]));if(raw)vis++;
+    const g=LG[i];track(bodyS[i],g?g.seen:raw,g?g.det:(raw?[W[i].x,W[i].y,W[i].z]:null),dt)}
+  const B=bodyS.map((s,i)=>out(s,T[i]));prevB=B;
 
   // 顔の向き(顔の変換行列から回転を取り出す)
   const fm=faceR&&faceR.facialTransformationMatrixes&&faceR.facialTransformationMatrixes[0];
