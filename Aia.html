@@ -29,11 +29,16 @@ label{font-size:13px;color:var(--mut)}
 <body>
 <h1>全身モーショントラッカー</h1>
 <div class="card">
-  <div class="stage"><video id="vid" playsinline muted></video><canvas id="ov"></canvas></div>
+  <div class="stage"><video id="vid" playsinline muted></video><canvas id="vc" hidden></canvas><canvas id="ov"></canvas></div>
   <div class="row">
     <button id="go">カメラ開始</button>
     <button id="flip" class="sub">前/背面切替</button>
     <span id="status">待機中</span>
+  </div>
+  <div class="row"><label>VRM: <input type="file" id="vf" accept=".vrm"></label></div>
+  <div class="row">
+    <label><input type="checkbox" id="dim"> 映像を暗くする</label>
+    <label><input type="checkbox" id="sk" checked> 骨格線を表示</label>
   </div>
 </div>
 <div class="card">
@@ -53,6 +58,7 @@ label{font-size:13px;color:var(--mut)}
 </div>
 <p style="font-size:12px;color:var(--mut)">全身が映るよう2〜3m離れて撮影してください。画面外や未検出の部位は、基本姿勢(テンプレ)へゆっくり戻ります。映像は端末内で処理されます。</p>
 
+<script type="importmap">{"imports":{"three":"https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js","three/addons/":"https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/","three/examples/jsm/":"https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/","@pixiv/three-vrm":"https://cdn.jsdelivr.net/npm/@pixiv/three-vrm@3.0.0/lib/three-vrm.module.js"}}</script>
 <script type="module">
 import {PoseLandmarker,HandLandmarker,FaceLandmarker,FilesetResolver} from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/vision_bundle.mjs";
 const $=id=>document.getElementById(id);
@@ -191,7 +197,7 @@ async function startCam(){
   if(stream)stream.getTracks().forEach(t=>t.stop());
   stream=await navigator.mediaDevices.getUserMedia({video:{facingMode:facing,width:{ideal:960},height:{ideal:1280}},audio:false});
   vid.srcObject=stream;await vid.play();
-  const m=facing==="user";vid.classList.toggle("mirror",m);ov.classList.toggle("mirror",m);
+  const m=facing==="user";vid.classList.toggle("mirror",m);ov.classList.toggle("mirror",m);vc.classList.toggle("mirror",m);
 }
 $("go").onclick=async()=>{
   try{
@@ -202,6 +208,84 @@ $("go").onclick=async()=>{
   }catch(e){status("エラー: "+(e.message||e)+"(カメラ許可/ネットワークを確認)")}
 };
 $("flip").onclick=async()=>{facing=facing==="user"?"environment":"user";if(stream)try{await startCam()}catch(e){status("切替失敗")}};
+
+// ---- VRM重ね合わせ(three / three-vrm は読み込み時に動的取得。失敗しても本体は動く) ----
+const vc=$("vc");let vx=null;
+$("dim").onchange=()=>{vid.style.opacity=$("dim").checked?.25:1};
+const FG=[["Thumb",["Metacarpal","Proximal","Distal"],1],["Index",["Proximal","Intermediate","Distal"],5],["Middle",["Proximal","Intermediate","Distal"],9],["Ring",["Proximal","Intermediate","Distal"],13],["Little",["Proximal","Intermediate","Distal"],17]];
+// 各ボーンの「待機方向」(子ボーンの局所位置)と「狙う方向(2点)」の対応表
+function buildDrive(hn,TH){
+  const Dv=[],V=(a,i)=>new TH.Vector3(a[i][0],-a[i][1],-a[i][2]);
+  const add=(n,c,f)=>{const a=hn(n);if(!a)return;const b=c&&hn(c);if(!b&&/Foot$/.test(n))return;Dv.push({a,r:(b?b.position:a.position).clone().normalize(),f})};
+  for(const s of[0,1]){
+    const p=s?"right":"left",sh=11+s,el=13+s,wr=15+s,hp=23+s,kn=25+s,an=27+s,to=31+s;
+    add(p+"UpperArm",p+"LowerArm",S=>[V(S.B,sh),V(S.B,el)]);
+    add(p+"LowerArm",p+"Hand",S=>[V(S.B,el),V(S.B,wr)]);
+    add(p+"Hand",p+"MiddleProximal",S=>[V(S.hands[s],0),V(S.hands[s],9)]);
+    for(const[g,nm,st]of FG)nm.forEach((x,j)=>add(p+g+x,nm[j+1]&&p+g+nm[j+1],S=>[V(S.hands[s],st+j),V(S.hands[s],st+j+1)]));
+    add(p+"UpperLeg",p+"LowerLeg",S=>[V(S.B,hp),V(S.B,kn)]);
+    add(p+"LowerLeg",p+"Foot",S=>[V(S.B,kn),V(S.B,an)]);
+    add(p+"Foot",p+"Toes",S=>[V(S.B,an),V(S.B,to)]);
+  }
+  return Dv;
+}
+$("vf").onchange=async e=>{
+  const f=e.target.files[0];if(!f)return;
+  try{
+    status("VRM読み込み中…");
+    const[TH,{GLTFLoader},VR]=await Promise.all([import("three"),import("three/addons/loaders/GLTFLoader.js"),import("@pixiv/three-vrm")]);
+    const buf=await f.arrayBuffer(),ld=new GLTFLoader();ld.register(p=>new VR.VRMLoaderPlugin(p));
+    const gltf=await new Promise((ok,ng)=>ld.parse(buf,"",ok,ng));
+    const vrm=gltf.userData.vrm;if(!vrm)throw new Error("VRM形式ではありません");
+    VR.VRMUtils.rotateVRM0(vrm);
+    if(!vx){
+      const renderer=new TH.WebGLRenderer({canvas:vc,alpha:true,antialias:true});renderer.setClearColor(0x000000,0);
+      const scene=new TH.Scene(),dl=new TH.DirectionalLight(0xffffff,Math.PI);dl.position.set(.5,1,1.5);
+      scene.add(dl,new TH.AmbientLight(0xffffff,.6));
+      vx={TH,renderer,scene,cam:new TH.OrthographicCamera(0,1,1,0,-5000,5000),k:0,pos:null,w:0,h:0};
+    }
+    if(vx.vrm)vx.scene.remove(vx.vrm.scene);
+    vx.scene.add(vrm.scene);vrm.scene.updateMatrixWorld(true);
+    const hn=n=>vrm.humanoid.getNormalizedBoneNode(n),hips=hn("hips");
+    Object.assign(vx,{vrm,hn,hips,rigRoot:hips.parent,hipR:hips.getWorldPosition(new TH.Vector3()),drv:null});
+    vx.rigQ=hips.parent.getWorldQuaternion(new TH.Quaternion());
+    vx.drv=buildDrive(hn,TH);
+    vc.hidden=false;status("VRM読み込み完了");
+  }catch(err){status("VRMエラー: "+(err.message||err))}
+};
+// 安定化済みの骨格(B)・指(hands)・顔の向き(HR)からVRMのボーン回転を作り、映像と同じ座標で描画
+function vrmFrame(S){
+  if(!vx||!vx.drv)return;
+  const{TH,vrm,rigQ,rigRoot,hips}=vx,vw=vid.videoWidth,vh=vid.videoHeight;if(!vw)return;
+  if(vx.w!==vw||vx.h!==vh){const q=Math.min(1,720/Math.max(vw,vh));vx.renderer.setSize(Math.round(vw*q),Math.round(vh*q),false);
+    Object.assign(vx.cam,{left:0,right:vw,top:vh,bottom:0});vx.cam.updateProjectionMatrix();vx.w=vw;vx.h=vh}
+  const{B,L,W,HR}=S,V=a=>new TH.Vector3(a[0],-a[1],-a[2]);
+  // 位置とスケール(映像のピクセル座標に合わせる)
+  const sIn=L&&inside(L[11])&&inside(L[12]),hIn=L&&inside(L[23])&&inside(L[24]);
+  const mid=(i,j)=>[(L[i].x+L[j].x)/2*vw,(L[i].y+L[j].y)/2*vh];
+  if(sIn&&hIn){const a=mid(11,12),b=mid(23,24),wd=Math.hypot((W[11].x+W[12].x-W[23].x-W[24].x)/2,(W[11].y+W[12].y-W[23].y-W[24].y)/2);
+    if(wd>.15){const est=Math.hypot(a[0]-b[0],a[1]-b[1])/wd;vx.k=vx.k?vx.k+(est-vx.k)*.1:est}}
+  const k=vx.k||vh/2;let tg=null;
+  if(sIn){const a=mid(11,12);tg=[a[0]+k*((B[23][0]+B[24][0])/2-(B[11][0]+B[12][0])/2),a[1]+k*((B[23][1]+B[24][1])/2-(B[11][1]+B[12][1])/2)]}
+  else if(hIn)tg=mid(23,24);
+  if(tg){if(vx.pos){const f=1-Math.exp(-25*S.dt);vx.pos=[vx.pos[0]+(tg[0]-vx.pos[0])*f,vx.pos[1]+(tg[1]-vx.pos[1])*f]}else vx.pos=tg}
+  if(!vx.pos)return;
+  const sc=vrm.scene;sc.scale.setScalar(k);sc.position.set(vx.pos[0]-k*vx.hipR.x,vh-vx.pos[1]-k*vx.hipR.y,0);
+  // ボーン回転:ワールド姿勢を求め、親の姿勢を引いて局所回転にする
+  const wq=new Map(),wo=n=>!n||n===rigRoot?rigQ:(wq.get(n)||wo(n.parent));
+  const setW=(node,nw)=>{node.quaternion.copy(wo(node.parent).clone().invert().multiply(nw));wq.set(node,nw)};
+  const xa=V(B[23]).sub(V(B[24])).normalize(),sh=V(B[11]).add(V(B[12])).multiplyScalar(.5),hp=V(B[23]).add(V(B[24])).multiplyScalar(.5);
+  const ya=sh.sub(hp).normalize(),za=new TH.Vector3().crossVectors(xa,ya).normalize(),xo=new TH.Vector3().crossVectors(ya,za);
+  setW(hips,new TH.Quaternion().setFromRotationMatrix(new TH.Matrix4().makeBasis(xo,ya,za)).multiply(rigQ));
+  const Dm=[1,-1,-1],e=[];for(let i=0;i<3;i++){for(let j=0;j<3;j++)e.push(Dm[i]*Dm[j]*HR[i][j]);e.push(0)}
+  const head=vx.hn("head");
+  if(head)setW(head,new TH.Quaternion().setFromRotationMatrix(new TH.Matrix4().set(...e,0,0,0,1)).multiply(rigQ));
+  for(const d of vx.drv){
+    const[p0,p1]=d.f(S),v=p1.sub(p0);if(v.lengthSq()<1e-6)continue;v.normalize();
+    setW(d.a,new TH.Quaternion().setFromUnitVectors(d.r.clone().applyQuaternion(rigQ),v).multiply(rigQ));
+  }
+  vrm.update(S.dt);vx.renderer.render(vx.scene,vx.cam);
+}
 
 function loop(){
   requestAnimationFrame(loop);
@@ -249,8 +333,9 @@ function loop(){
   $("a0").textContent=ang(B[11],B[13],B[15]);$("a1").textContent=ang(B[12],B[14],B[16]);
   $("a2").textContent=ang(B[23],B[25],B[27]);$("a3").textContent=ang(B[24],B[26],B[28]);
 
-  drawOverlay(L,handR&&handR.landmarks);
+  $("sk").checked?drawOverlay(L,handR&&handR.landmarks):ctx.clearRect(0,0,ov.width,ov.height);
   draw3d({B,hp,C,hands});
+  vrmFrame({B,hands,HR,L,W,dt});
 }
 
 // カメラ映像上には「生の検出結果」だけを表示
